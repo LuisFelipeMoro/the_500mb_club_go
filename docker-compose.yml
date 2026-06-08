@@ -1,0 +1,74 @@
+# Aggregate: 2.00 vCPU, 296 MiB (caps: 2.0 CPU / 500 MiB — validate_compose.py rejects above).
+# Hardening fields are also gate-injected when absent; declared here for local-prod parity.
+
+services:
+  api-1: &api
+    image: ghcr.io/luisfelipemoro/pi-bench:latest    # public; arm64 manifest required (lowercase per OCI)
+    user: "10000:10000"                              # matches Dockerfile USER; audit_image.sh
+    cpus: '0.60'                                     # < 1.0 → automaxprocs sets GOMAXPROCS=1
+    mem_limit: 64m                                   # GOMEMLIMIT=24MiB << 64m
+    environment:
+      REDIS_ADDR: redis:6379
+      INSTANCE_ID: api-1
+      GOMAXPROCS: "1"
+      GOMEMLIMIT: 24MiB
+      GOGC: "50"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp]
+    networks: [backend]
+    depends_on: [redis]
+
+  api-2:
+    <<: *api
+    environment:
+      REDIS_ADDR: redis:6379
+      INSTANCE_ID: api-2
+      GOMAXPROCS: "1"
+      GOMEMLIMIT: 24MiB
+      GOGC: "50"
+
+  api-3:
+    <<: *api
+    environment:
+      REDIS_ADDR: redis:6379
+      INSTANCE_ID: api-3
+      GOMAXPROCS: "1"
+      GOMEMLIMIT: 24MiB
+      GOGC: "50"
+
+  lb:
+    image: nginx:1.27-alpine
+    ports: ["8080:80"]                               # challenge requires port 8080
+    cpus: '0.10'
+    mem_limit: 24m
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/var/cache/nginx, /var/run, /tmp]
+    networks: [backend]
+    depends_on: [api-1, api-2, api-3]
+
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --maxmemory
+      - "50mb"
+      - --maxmemory-policy
+      - "allkeys-lru"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    cpus: '0.10'
+    mem_limit: 80m
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    networks: [backend]
+
+networks:
+  backend:
+    internal: true                                   # no external egress; pairs with scratch

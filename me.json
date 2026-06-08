@@ -1,0 +1,12 @@
+{
+  "collaborators": [
+    {
+      "name": "Luis Felipe Moro",
+      "social_links": [
+        "https://github.com/LuisFelipeMoro",
+        "https://www.linkedin.com/in/luis-felipe-moro-1a7427188/"
+      ]
+    }
+  ],
+  "stack": ["go", "redis", "nginx"]
+}
