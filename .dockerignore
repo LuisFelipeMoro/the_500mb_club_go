@@ -1,0 +1,9 @@
+.git
+.gitignore
+.claude
+*.md
+Dockerfile
+.dockerignore
+docker-compose.yml
+nginx.conf
+me.json
