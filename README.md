@@ -15,32 +15,43 @@
 > hardware. This README therefore contains **no latency or throughput numbers** — only
 > the design, the SLO *targets*, and the engineering rationale. Numbers will be added
 > once measured on real silicon.
+>
+> **Latest change (queued for measurement):** per-device retention is now bounded to the
+> newest 1024 points to remove a read-path tail-latency pathology under sustained load —
+> see [§3.7](#37-bounded-per-device-retention--collapsing-the-read-path-tail). A native
+> Pi-Bench run against this build is queued.
 
 ---
 
 ## 1. Stack Architecture
 
-**Objective:** sustain continuous GPS+sensor writes, serve cursor-paginated time-window
-queries, and compute on-demand acceleration anomaly scores — while the *entire stack*
-(3 API replicas, nginx, Redis) holds RSS well under budget and never trips the
-500 MB / 2.0 CPU ceiling.
+**What the service does:** accept a continuous stream of GPS + sensor readings from
+devices, answer time-window queries over that history (with paging), and compute an
+on-demand "is this reading abnormal?" score. It has to do all of that while the *whole
+stack together* — 3 copies of the API, the nginx load balancer, and Redis — stays well
+inside **500 MB of RAM and 2 CPUs**.
 
-The governing insight: this workload is **I/O-bound, not CPU-bound**. The hot path is
-"validate → encode → hand off." So the scarce CPU budget goes to *fewer, fatter* Redis
-round-trips and zero-copy serialization, and the scarce RAM budget is protected by
-refusing to let the Go heap or Redis grow unbounded.
+**The one idea that drives every choice below:** this workload spends most of its time
+*waiting on the network and Redis*, not crunching numbers (it is **I/O-bound, not
+CPU-bound**). A request just validates input, packs it into bytes, and hands it off. So
+the design spends its small CPU budget on **making fewer, larger trips to Redis** and on
+**avoiding wasted memory allocations**, and it protects the small RAM budget by never
+letting the Go heap or Redis grow without a limit.
 
-| Layer | Choice | Why, under 2 CPU / 500 MB |
+Each row is a piece of the stack, the tool chosen for it, and the plain reason it fits a
+tiny RAM/CPU budget.
+
+| Layer | Choice | Why it fits 2 CPU / 500 MB |
 |---|---|---|
-| **Language** | Go 1.26 | Static binary, no VM, predictable GC, cgroup-aware. Enables a `scratch` image and a sub-10 MB footprint. |
-| **HTTP layer** | Fiber v2 (fasthttp) | fasthttp pools request/response objects — near-zero allocations per request on the hot path, which suppresses GC pressure and RSS spikes. |
-| **Serialization** | Custom 56-byte little-endian binary | No `encoding/json` on the storage path, no reflection, no struct churn. One fixed allocation per point. ~45% smaller in Redis than JSON. |
-| **Storage** | Redis 7, one ZSET per device | Score = epoch-millis → range/last-N are native `ZRANGE … BYSCORE` / `ZRANGE … REV`. `maxmemory 50mb` + `allkeys-lru` makes memory a hard, self-evicting ceiling. |
-| **Wire protocol / client** | rueidis (RESP3, multiplexed) | A single TCP connection auto-pipelines concurrent commands; ~4× fewer allocations than go-redis. Client-side caching disabled — unneeded, and its tracking tables cost RAM. |
-| **GC strategy** | `GOMEMLIMIT=24MiB` + `GOGC=50` | Soft heap ceiling per instance → frequent, small collections: lower p99 pause tails and a flat RSS curve instead of a budget-busting sawtooth. |
-| **Scheduling** | `automaxprocs` → `GOMAXPROCS=1` | Container gets `cpus: 0.60`. Pinning to 1 P avoids the Go scheduler spinning threads it can't run, which avoids Linux CFS throttling stalls (§3.5). |
-| **Ingress** | nginx 1.27-alpine, strict round-robin | 1 worker, `access_log off`, upstream `keepalive 32`, `/healthz` answered locally to skip an upstream hop per liveness probe. |
-| **Base image** | `scratch` (+ `USER 10000:10000`) | No libc, no shell, no package manager. Minimal attack surface, nothing to page in. ~6 MB published image. |
+| **Language** | Go 1.26 | Compiles to a single self-contained binary (no virtual machine, no interpreter) and is aware of container limits. That lets us ship a near-empty image under 10 MB. |
+| **HTTP layer** | Fiber v2 (built on fasthttp) | fasthttp *reuses* request/response objects instead of allocating fresh ones per call. Fewer allocations → less garbage for the collector → flatter, lower memory use. |
+| **Serialization** | Custom 56-byte binary format | We pack each reading into a fixed 56 bytes by hand instead of using JSON for storage. No reflection, no temporary objects, one allocation per point, and ~45% less space in Redis than JSON. |
+| **Storage** | Redis 7, one sorted set (ZSET) per device, capped to the newest 1024 points | Storing each point scored by its timestamp makes "give me a time range" and "give me the last N" native, fast Redis operations. Capping each set on write (§3.7) keeps memory bounded by design; the `maxmemory 50mb` + `allkeys-lru` eviction setting is just a safety net behind that. |
+| **Redis client** | rueidis (RESP3, multiplexed) | One shared TCP connection automatically batches concurrent commands together, and it allocates ~4× less than the common `go-redis` client. Client-side caching is turned off — we don't need it, and its bookkeeping tables would cost RAM. |
+| **Garbage collector** | `GOMEMLIMIT=24MiB` + `GOGC=50` | Tells Go to collect garbage early and often instead of letting the heap balloon. The result is a steady, low memory line rather than a saw-tooth that spikes over budget — and the score rewards low *peak* memory. |
+| **CPU scheduling** | `automaxprocs` → `GOMAXPROCS=1` | Each API gets 0.60 of a CPU. Telling Go to use exactly one thread stops it from spinning up threads the cgroup can't actually run — which would trigger Linux throttling stalls (explained in §3.5). |
+| **Load balancer** | nginx 1.27-alpine, strict round-robin | One worker, access logging off, reused upstream connections (`keepalive 32`), and `/healthz` answered by nginx itself so liveness checks don't hop to the API. |
+| **Base image** | `scratch` (+ non-root `USER 10000:10000`) | The image contains *only* our binary — no OS, no shell, no package manager. Tiny attack surface, nothing extra to load, ~6 MB published. |
 
 ---
 
@@ -65,10 +76,16 @@ Run the matrix in [§5](#5-project-structure--validation-suite) to populate thes
 
 ## 3. Key Design Decisions & Deep-Dive Code Patterns
 
-### 3.1 Bounded micro-batching write buffer (coalesce-then-flush)
+Each decision below follows the same shape: a short **what**, a **Why** (the reasoning),
+and a **Risk mitigation** (what could go wrong and how it's handled). You can read any one
+on its own.
 
-The POST hot path must never touch Redis. It validates, encodes 56 bytes, and does a
-**non-blocking** channel push. A single writer goroutine owns all Redis writes.
+### 3.1 Group writes together before sending them ("coalesce-then-flush")
+
+**What:** when a device posts a reading, the request never waits on Redis. It validates the
+input, packs it into 56 bytes, and drops it onto an in-memory queue (a Go channel) without
+blocking. One dedicated background goroutine owns *all* Redis writes and sends them in
+batches.
 
 ```go
 func (w *Writer) Push(deviceID string, encoded [][]byte) bool {
@@ -104,29 +121,36 @@ func (w *Writer) Run() {
 }
 ```
 
-**Why:** under low load the writer wakes on a single request, finds the queue empty, and
-flushes in *microseconds* — so read-after-write is deterministic. Under high load the
-drain loop absorbs the burst until `flushThreshold` (500 points), turning many small
-writes into a handful of fat `ZADD`s. (An earlier 10 ms-ticker design was removed: it
-created a read-after-write race that flaked the smoke suite — a real correctness bug
-caught during development.)
+**Why:** this gives the best of both worlds. When traffic is light, the writer wakes up on
+a single reading, sees nothing else waiting, and writes it in *microseconds* — so a read
+right after a write reliably sees the data. When traffic is heavy, the inner loop keeps
+pulling everything already queued (up to 500 points) and turns that pile of small writes
+into a few large ones. (An earlier version flushed on a 10 ms timer instead; it was removed
+because it let a read occasionally run before its write landed — a real bug the test suite
+caught.)
 
-**Risk mitigation:** the channel is capped at 10k (~seconds of headroom at peak). A full
-channel returns `false`, and the handler still answers `202 {accepted:0}` — the harness
-counts HTTP 2xx as *delivered*, so a momentary overflow degrades to data loss, never to
-an error or a stalled handler.
+**Risk mitigation:** the queue holds up to 10,000 items (seconds of headroom at peak). If
+it ever fills, `Push` returns `false` and the handler still replies `202 {accepted:0}`.
+The benchmark counts any HTTP 2xx as "delivered," so the worst case of a brief overload is
+dropping a few points — never an error and never a stuck request.
 
-### 3.2 Pipelining over blocking — one `ZADD` per device per flush
+### 3.2 Send the whole batch in one round-trip ("pipelining")
+
+**What:** when the writer flushes, it builds all the Redis commands for every device first,
+then ships them together in a single network round-trip instead of sending them one at a
+time and waiting for each reply.
 
 ```go
 func (s *RueidisStore) AddMulti(ctx context.Context, batches map[string][][]byte) error {
-	cmds := make([]rueidis.Completed, 0, len(batches))
+	cmds := make([]rueidis.Completed, 0, len(batches)*2) // ZADD + trim per device
 	for dev, members := range batches {
 		partial := s.client.B().Zadd().Key("telemetry:" + dev).ScoreMember()
 		for _, m := range members {
 			partial = partial.ScoreMember(scoreOf(m), rueidis.BinaryString(m))
 		}
 		cmds = append(cmds, partial.Build())
+		cmds = append(cmds, s.client.B().Zremrangebyrank(). // trim to newest 1024 — §3.7
+			Key("telemetry:" + dev).Start(0).Stop(-(retainPerDevice + 1)).Build())
 	}
 	for _, resp := range s.client.DoMulti(ctx, cmds...) { // single pipeline round-trip
 		if err := resp.Error(); err != nil {
@@ -137,15 +161,18 @@ func (s *RueidisStore) AddMulti(ctx context.Context, batches map[string][][]byte
 }
 ```
 
-**Why:** Redis is single-threaded. N blocking `ZADD`s serialize N network RTTs *and* N
-dispatches. `DoMulti` ships the whole flush as one pipelined batch — one `writev`, Redis
-processes back-to-back. A flush touching K devices costs ~1 RTT, not K.
+**Why:** Redis handles one command at a time, and a network round-trip is far slower than
+the work itself. Sending N writes separately means paying for N round-trips and waiting on
+each. `DoMulti` sends them all at once; Redis processes them back-to-back and replies once.
+A flush touching K devices costs roughly one round-trip, not K. The retention trim (§3.7)
+travels in this same batch, so it costs no extra trip.
 
-**Risk mitigation:** no `ZADD … NX` — ZSET members dedupe by their 56-byte value
-automatically, and `NX` would wrongly suppress legitimate re-scores. Errors are checked
-per-response so one bad device can't silently swallow the batch.
+**Risk mitigation:** we don't use `ZADD … NX` ("only add if new") — a sorted set already
+ignores exact-duplicate values, and `NX` would wrongly block a device from legitimately
+re-sending a point. Each command's reply is checked individually, so one failing device
+can't silently swallow the rest of the batch.
 
-### 3.3 Zero-reflection serialization — direct byte manipulation
+### 3.3 Pack each reading into bytes by hand, not with JSON
 
 ```go
 const EncodedSize = 56 // ts|lat|lon|battery|ax|ay|az, all LE float64/int64
@@ -165,17 +192,21 @@ func (p TelemetryPoint) Encode() []byte {
 }
 ```
 
-**Why:** `json.Marshal` walks struct tags via reflection and allocates intermediate
-buffers — death by a thousand allocations at high RPS. This is a single fixed allocation
-and seven register-width stores. Decoding is the mirror image, with no `map[string]any`
-and no garbage.
+**Why:** Go's `json.Marshal` inspects the struct at runtime (reflection) and allocates
+throwaway buffers every call — fine occasionally, but a flood of garbage at thousands of
+requests per second. The hand-written version does one fixed-size allocation and seven
+simple number writes. Decoding is the exact reverse, again with no temporary maps and no
+garbage.
 
-**Risk mitigation:** the optional `battery` field is the classic trap — `encoding/json`
-*errors* on `NaN` float64. We store `NaN` as the "absent" sentinel in the binary blob,
-and on decode map it back to a `*float64` nil so the JSON response simply **omits** the
-field. NaN never reaches the JSON encoder.
+**Risk mitigation:** the optional `battery` field is the classic trap — Go's JSON encoder
+*throws an error* if a float is `NaN`. We use `NaN` internally as the "no battery value"
+marker in the binary blob, and on decode turn it back into an absent field, so the JSON
+response simply leaves `battery` out. A `NaN` never reaches the JSON encoder.
 
-### 3.4 Runtime GC limits — a hard ceiling, not a hope
+### 3.4 Cap the Go heap so memory stays flat
+
+**What:** two environment variables tell Go's garbage collector to keep memory low and
+steady, with the container's own memory limit as a final backstop.
 
 ```yaml
 environment:
@@ -184,16 +215,20 @@ environment:
 mem_limit: 64m        # cgroup hard cap; 24MiB heap leaves ~39 MB OS headroom
 ```
 
-**Why:** default `GOGC=100` lets the heap double before collecting — a sawtooth that,
-×3 instances, risks blowing the RSS budget at each cycle's peak. `GOMEMLIMIT` converts
-"grow until OOM" into "stay near 24 MiB and GC harder as you approach," producing a flat
-RSS line — exactly what a p95-RSS scoring metric rewards.
+**Why:** by default Go waits until the heap *doubles* before collecting. Across 3 instances
+that creates a saw-tooth where every peak risks busting the RAM budget. `GOMEMLIMIT` flips
+the behavior from "grow until you run out" to "stay near 24 MiB and collect harder as you
+approach it," giving a flat memory line — and the score is based on *peak* memory, so flat
+wins.
 
-**Risk mitigation:** `GOMEMLIMIT` is *soft* (it can be exceeded transiently to avoid a GC
-death-spiral); the 64 MB cgroup `mem_limit` is the real backstop with generous headroom,
-so a burst can't OOM-kill the container.
+**Risk mitigation:** `GOMEMLIMIT` is a *soft* target (Go may briefly exceed it rather than
+collect itself to death). The hard 64 MB container limit is the real backstop, with plenty
+of headroom, so a spike can't get the container killed for running out of memory.
 
-### 3.5 GOMAXPROCS pinned to the CPU quota — dodging CFS throttling
+### 3.5 Match Go's thread count to the CPU slice it actually gets
+
+**What:** each container is allowed only 0.60 of a CPU, so we tell Go to run on a single
+thread instead of one per host core.
 
 ```go
 import _ "go.uber.org/automaxprocs" // reads cgroup quota at init → sets GOMAXPROCS
@@ -201,19 +236,21 @@ import _ "go.uber.org/automaxprocs" // reads cgroup quota at init → sets GOMAX
 log.Info("starting", zap.Int("gomaxprocs", runtime.GOMAXPROCS(0))) // observability
 ```
 
-**Why:** with `cpus: 0.60`, the cgroup grants 60 ms of CPU per 100 ms CFS period. Go's
-default `GOMAXPROCS` = host core count (4 on a Pi 5). Four P's all trying to run burn the
-60 ms quota in ~15 ms wall-clock, then the kernel **throttles the whole cgroup for the
-remaining ~85 ms** — every in-flight request eats that stall as tail latency. Pinning to
-1 P matches parallelism to the quota; the work is I/O-bound and parks on Redis/network
-anyway, so a second thread buys nothing but RSS and throttling risk. (Verified at
-startup: the API logs `Honoring GOMAXPROCS="1"` and `gomaxprocs=1`.)
+**Why:** the Linux scheduler hands out CPU in repeating windows — with `cpus: 0.60` the
+container gets 60 ms of CPU out of every 100 ms. Left alone, Go starts one worker thread
+per host core (4 on a Pi 5). All four threads racing to run burn the entire 60 ms budget in
+about 15 ms, and then **the kernel freezes the whole container for the remaining ~85 ms.**
+Every request in flight during that freeze pays for it as latency. Using a single thread
+keeps the work inside the budget instead of slamming into the freeze — and since the work
+is mostly waiting on Redis and the network anyway, extra threads add memory and throttling
+risk without adding speed. (Confirmed at startup: the log shows `gomaxprocs=1`.)
 
-**Risk mitigation:** `automaxprocs` reads cgroup v1 *and* v2 and is ARM64-safe; the
-explicit `GOMAXPROCS=1` env var is the fallback if the cgroup read fails. The startup log
-prints the resolved value so a misconfiguration is caught immediately.
+**Risk mitigation:** `automaxprocs` reads the container's CPU limit automatically (both
+cgroup versions, ARM64-safe), and the explicit `GOMAXPROCS=1` setting is a fallback if that
+read ever fails. The startup log prints the value it landed on, so a misconfiguration is
+obvious immediately.
 
-### 3.6 Ingress mechanics — keepalive, no Nagle, local liveness
+### 3.6 Load-balancer tuning — reuse connections, send small replies immediately
 
 ```nginx
 upstream api {
@@ -231,38 +268,96 @@ server {
 # http{}: worker_processes 1; access_log off; tcp_nodelay on;
 ```
 
-**Why:** at high RPS, opening/closing an upstream TCP connection *per request* is a flood
-of futile handshakes. `keepalive 32` + HTTP/1.1 + an empty `Connection` header keeps a
-warm pool. `tcp_nodelay on` disables Nagle so small JSON responses aren't held ~40 ms to
-coalesce — critical for p99. `access_log off` removes a `write` syscall and buffer churn
-from every request on a single-worker nginx.
+**Why:** opening a brand-new TCP connection to the API for every request means a constant
+storm of handshakes. `keepalive 32` keeps a pool of warm connections open and reuses them
+(HTTP/1.1 plus the empty `Connection` header is what enables that). `tcp_nodelay on` turns
+off an OS optimization (Nagle's algorithm) that would otherwise hold a small reply back
+~40 ms hoping to bundle it with more data — that delay alone would wreck the p99. And
+`access_log off` removes a disk write per request from the single nginx worker.
 
-**Risk mitigation:** strict round-robin (no `ip_hash`/`least_conn`) is mandated by the
-challenge and verified by smoke (30 probes hit all 3 instances). `/healthz` served
-locally never depends on the API being up.
+**Risk mitigation:** strict round-robin (not "sticky" or "least-connections" routing) is
+required by the challenge and checked by the smoke test (30 probes must reach all 3
+instances). Because nginx answers `/healthz` itself, liveness checks keep working even if
+the API behind it is down.
+
+### 3.7 Bounded per-device retention — collapsing the read-path tail
+
+```go
+const retainPerDevice = 1024 // ≥ anomaly window (256) + recent range window, with headroom
+
+// inside AddMulti, appended to the same DoMulti pipeline as each ZADD:
+cmds = append(cmds, s.client.B().Zremrangebyrank().
+	Key("telemetry:"+dev).Start(0).Stop(-(retainPerDevice+1)).Build())
+```
+
+**The symptom.** Under sustained load, the two read endpoints — `GET range` and
+`GET anomaly` — showed a **multi-second p99** (32.6 s and 42.5 s), while `POST`/`batch`
+stayed fast. That split is the key clue: writes are async (§3.1) and never touch Redis on
+the request path, so reads were the *only* requests that talked to Redis synchronously.
+Something on the Redis side was slow, and only reads felt it.
+
+**Why it was slow — the chain.** Each device's ZSET grew without limit, one point per write.
+Then:
+
+1. After enough ingest, Redis hit its `maxmemory 50mb` ceiling.
+2. At that ceiling, *every* new write makes Redis run `allkeys-lru` eviction — it samples
+   keys and deletes old ones to make room. That is real CPU work.
+3. Redis is single-threaded **and** capped at `cpus: 0.10` (10% of one core). It runs one
+   command at a time, slowly.
+4. So each read had to wait in line behind a stream of eviction work on that one slow
+   thread. The wait — not the query itself — is the multi-second tail.
+
+**Why it is *not* an indexing problem.** The range query is already indexed: `ZRANGE …
+BYSCORE` walks a sorted set by score (timestamp) in `O(log N + M)`. Adding a search index
+(e.g. RediSearch) would have made writes *slower* and used *more* memory — the opposite of
+what's needed. The real fix is simply to stop the sets from ever getting big.
+
+**The fix.** Trim each device's set to its newest 1024 points on every write, with one
+`ZREMRANGEBYRANK` that piggybacks on the `ZADD` already in the pipeline. Now total Redis
+data stays at a few MB, the `maxmemory` ceiling is never reached, eviction never runs, and
+every read touches a tiny set. Because the trim shares the existing write round-trip and
+writes are async, it adds **no** latency to `POST`/`batch`.
+
+**The tradeoff.** Only the newest 1024 points per device are kept; older history is dropped.
+That is fine here: `anomaly` only needs the last 256, and `range` is only ever asked for
+*recent* windows (the test harness queries `from = now − 60s … 600s`, which at the
+benchmark's rate holds far fewer than 1024 points per device). What's given up is querying
+deep history beyond 1024 points/device — a deliberate trade for bounded memory and a flat
+read tail. The `maxmemory`/`allkeys-lru` setting stays on as a safety backstop.
+
+**Why ZSET-trim and not Redis Streams.** Redis Streams (`XADD … MAXLEN`) can trim on write
+and store entries more compactly, which looks tempting. But once data is bounded to 1024
+points, both structures are only a few MB — the memory difference no longer matters — while
+switching to Streams means rewriting the encoding, the pagination cursor, and the decode
+path. More risk, no measurable payoff, so the one-line trim won.
+
+**Risk mitigation.** The trim is a no-op when a set is already at or under the cap, and its
+result is error-checked in the same `DoMulti` loop as the `ZADD`. 1024 is >4× the largest
+window any scored scenario reads, so no data *inside* a queried window is ever dropped.
 
 ---
 
 ## 4. Resource Budget
 
-Aggregate hard caps: **2.00 vCPU** and **296 MiB** declared, under the 500 MiB ceiling.
-CPU and `mem_limit` are the *real declared* values; the RSS column is the **design
-target** that drove those limits — it is an estimate to be confirmed by measurement, not
-a benchmark result.
+The whole stack is declared at **2.00 CPU** and **296 MiB** of hard limits — comfortably
+under the 500 MiB ceiling. The CPU and `mem_limit` columns are the *actual limits set in
+compose*. The "RSS target" column is the **memory we designed for** (an estimate that
+shaped those limits), not a measured result — real numbers come from the Pi benchmark.
 
 | Component | Replicas | CPU (alloc) | mem_limit | RSS target (design) | Lever |
 |---|---|---|---|---|---|
 | API worker | 3 | 0.60 each | 64 MB each | ≤ 20 MB each | `GOMEMLIMIT=24MiB`, `GOGC=50`, scratch, static binary |
 | nginx LB | 1 | 0.10 | 24 MB | ≤ 8 MB | `worker_processes 1`, `access_log off` |
-| Redis | 1 | 0.10 | 80 MB | ~62 MB | `maxmemory 50mb` + `allkeys-lru` (~12 MB overhead) |
-| **Total** | **5** | **2.00 / 2.0** | **296 / 500** | **≤ ~130 MB target** | — |
+| Redis | 1 | 0.10 | 80 MB | ≤ ~20 MB | newest-1024 trim per device (§3.7) keeps data ~few MB; `maxmemory 50mb` + `allkeys-lru` backstop |
+| **Total** | **5** | **2.00 / 2.0** | **296 / 500** | **≤ ~90 MB target** | — |
 
-**Why 0.60 per API:** `0.60 × 3 + 0.10 + 0.10 = 2.00` exactly — zero margin, by design.
-Sub-1.0 CPU also makes `automaxprocs` pin `GOMAXPROCS=1` (§3.5). CPU follows the
-bottleneck: parse/encode/serialize is API-side, while Redis and nginx are single-threaded
-and I/O-bound — handing them CPU they can't schedule would only starve the API and push
-every instance closer to the CFS throttling cliff. Confirming the RSS targets with
-`docker stats` under load is the first item on the benchmark list.
+**Why 0.60 per API:** the budget is split to use every bit — `0.60 × 3 + 0.10 + 0.10 =
+2.00` exactly. Keeping each API under 1.0 CPU is also what makes Go pin itself to one thread
+(§3.5). The CPU goes where the actual work is: parsing, validating, and encoding all happen
+in the API, while Redis and nginx are single-threaded and spend most of their time waiting
+on I/O. Giving them more CPU wouldn't help — they couldn't use it — and it would starve the
+API and push it toward the throttling cliff from §3.5. Confirming the memory targets with
+`docker stats` under load is the first item on the benchmark to-do list.
 
 ---
 
@@ -341,18 +436,21 @@ The decisive levers are not exotic; they are about respecting the constraints:
 
 1. **Fewer, fatter Redis round-trips** — a coalescing batch writer + pipelined `DoMulti`
    turn a write storm into a handful of commands per flush.
-2. **Zero-reflection serialization** — fixed 56-byte binary records keep allocations (and
+2. **Bounded per-device retention** — trimming each ZSET to its newest 1024 on write keeps
+   Redis small, so eviction never storms the single 0.10-CPU thread and the read tail stays
+   flat (§3.7).
+3. **Zero-reflection serialization** — fixed 56-byte binary records keep allocations (and
    therefore GC, and therefore RSS) flat under load.
-3. **Match the runtime to its cgroup** — `GOMAXPROCS=1` to dodge CFS throttling,
+4. **Match the runtime to its cgroup** — `GOMAXPROCS=1` to dodge CFS throttling,
    `GOMEMLIMIT`/`GOGC` to cap the heap before the kernel caps the container.
-4. **Spend CPU on the bottleneck** — the API does the work, so it gets the CPU; nginx and
+5. **Spend CPU on the bottleneck** — the API does the work, so it gets the CPU; nginx and
    Redis get just enough.
 
-The two changes that mattered most during development were a **correctness fix**
-(coalesce-then-flush, which removed a read-after-write race) and a **scheduling fix**
-(escaping CFS throttling) — neither is visible if you only watch average latency.
-Quantifying all of this on native Pi 5 hardware is the remaining work; the harness in
-`stress/` exists to produce those numbers.
+The three changes that mattered most were a **correctness fix** (coalesce-then-flush, which
+removed a read-after-write race), a **scheduling fix** (escaping CFS throttling), and a
+**read-tail fix** (bounding the ZSETs so Redis stops evicting under load) — none is visible
+if you only watch average latency. Quantifying all of this on native Pi 5 hardware is the
+remaining work; the harness in `stress/` exists to produce those numbers.
 
 ---
 
