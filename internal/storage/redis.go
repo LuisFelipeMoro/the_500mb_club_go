@@ -40,6 +40,13 @@ func NewRueidisStore(addr string) (*RueidisStore, error) {
 
 func key(deviceID string) string { return "telemetry:" + deviceID }
 
+// retainPerDevice caps each device's sorted set to its newest members. The trim
+// runs in the write pipeline (see AddMulti) so the set stays small and bounded:
+// Redis never approaches its maxmemory ceiling, eviction never fires, and every
+// read (Range, LastN) touches a tiny set. 1024 covers the anomaly window (256)
+// and any recent range window the benchmark queries, with headroom.
+const retainPerDevice = 1024
+
 // scoreOf reads the LE int64 timestamp from a 56-byte member.
 func scoreOf(member []byte) float64 {
 	return float64(int64(binary.LittleEndian.Uint64(member[0:8])))
@@ -49,13 +56,22 @@ func (s *RueidisStore) AddMulti(ctx context.Context, batches map[string][][]byte
 	if len(batches) == 0 {
 		return nil
 	}
-	cmds := make([]rueidis.Completed, 0, len(batches))
+	// Two commands per device: the ZADD, then a rank trim keeping only the
+	// newest retainPerDevice members. Both ride the same DoMulti pipeline, so
+	// the trim adds no extra round-trip; on a set already within the cap the
+	// ZREMRANGEBYRANK is a no-op.
+	cmds := make([]rueidis.Completed, 0, len(batches)*2)
 	for dev, members := range batches {
 		partial := s.client.B().Zadd().Key(key(dev)).ScoreMember()
 		for _, m := range members {
 			partial = partial.ScoreMember(scoreOf(m), rueidis.BinaryString(m))
 		}
 		cmds = append(cmds, partial.Build())
+		cmds = append(cmds, s.client.B().Zremrangebyrank().
+			Key(key(dev)).
+			Start(0).
+			Stop(-(retainPerDevice+1)).
+			Build())
 	}
 	for _, resp := range s.client.DoMulti(ctx, cmds...) {
 		if err := resp.Error(); err != nil {
