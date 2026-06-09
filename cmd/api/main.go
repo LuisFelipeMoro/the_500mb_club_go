@@ -31,10 +31,9 @@ func main() {
 		zap.Int("gomaxprocs", runtime.GOMAXPROCS(0)),
 	)
 
-	store, err := connectRedis(addr, log, 60*time.Second)
-	if err != nil {
-		log.Fatal("redis connect failed", zap.Error(err))
-	}
+	// Lazy connect: never block boot on Redis. The HTTP server listens
+	// immediately; /readyz reports 503 until the background dialer succeeds.
+	store := storage.NewLazy(addr, log)
 
 	m := metrics.New()
 	writer := batch.New(store, 10000, log)
@@ -82,47 +81,6 @@ func main() {
 	// 3. Close the Redis connection.
 	store.Close()
 	log.Info("shutdown complete")
-}
-
-// connectRedis dials Redis, retrying with capped exponential backoff until a
-// Ping succeeds or the deadline passes. The API must not crash just because
-// Redis accepts connections a few hundred ms after its container starts:
-// compose depends_on only orders container *start*, not readiness, and a
-// transient blip mid-run shouldn't take an instance down. (The compose
-// healthcheck makes the cold-start ordering deterministic; this makes the
-// binary resilient on its own.)
-func connectRedis(addr string, log *zap.Logger, within time.Duration) (*storage.RueidisStore, error) {
-	deadline := time.Now().Add(within)
-	backoff := 200 * time.Millisecond
-	var lastErr error
-	for attempt := 1; ; attempt++ {
-		store, err := storage.NewRueidisStore(addr)
-		if err == nil {
-			pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			err = store.Ping(pctx)
-			cancel()
-			if err == nil {
-				if attempt > 1 {
-					log.Info("redis ready", zap.Int("attempt", attempt))
-				}
-				return store, nil
-			}
-			store.Close()
-		}
-		lastErr = err
-		if time.Now().After(deadline) {
-			return nil, lastErr
-		}
-		log.Warn("redis not ready, retrying",
-			zap.Int("attempt", attempt),
-			zap.Duration("backoff", backoff),
-			zap.Error(err),
-		)
-		time.Sleep(backoff)
-		if backoff < 2*time.Second {
-			backoff *= 2
-		}
-	}
 }
 
 func env(key, fallback string) string {

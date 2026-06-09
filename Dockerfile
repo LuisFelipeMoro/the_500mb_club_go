@@ -12,8 +12,10 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 COPY . .
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-arm64} \
-    go build -trimpath -ldflags="-s -w" -o /api ./cmd/api
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-arm64} \
+    go build -trimpath -buildvcs=false -ldflags="-s -w" -o /api ./cmd/api
 
 # Stage 2 — runtime (scratch: no libc, no shell, zero overhead). buildx sets the
 # runtime platform from --platform.
