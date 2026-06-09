@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -25,6 +26,8 @@ func main() {
 	addr := env("REDIS_ADDR", "localhost:6379")
 	instanceID := env("INSTANCE_ID", "api")
 	listen := ":" + env("PORT", "3000")
+	readTimeout := envDuration("READ_TIMEOUT_MS", 250*time.Millisecond)
+	flushTimeout := envDuration("WRITE_FLUSH_TIMEOUT_MS", 2*time.Second)
 
 	log.Info("starting pi-bench api",
 		zap.String("instance", instanceID),
@@ -36,10 +39,10 @@ func main() {
 	store := storage.NewLazy(addr, log)
 
 	m := metrics.New()
-	writer := batch.New(store, 10000, log)
+	writer := batch.New(store, 10000, flushTimeout, log)
 	go writer.Run()
 
-	h := handler.New(store, writer, m, log)
+	h := handler.New(store, writer, m, log, readTimeout)
 
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
@@ -88,4 +91,15 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envDuration reads an integer-millisecond env var, falling back to def on
+// absence or a non-positive/unparseable value.
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return def
 }

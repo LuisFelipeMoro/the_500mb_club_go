@@ -25,16 +25,20 @@ type Writer struct {
 	log   *zap.Logger
 
 	flushThreshold int
+	flushTimeout   time.Duration
 }
 
-// New creates a Writer with a buffered channel of the given capacity.
-func New(store storage.Store, bufSize int, log *zap.Logger) *Writer {
+// New creates a Writer with a buffered channel of the given capacity. flushTimeout
+// bounds each Redis flush: a stalled store releases the writer within it instead of
+// holding the single drain goroutine (and back-pressuring the buffer into drops).
+func New(store storage.Store, bufSize int, flushTimeout time.Duration, log *zap.Logger) *Writer {
 	return &Writer{
 		ch:             make(chan writeRequest, bufSize),
 		done:           make(chan struct{}),
 		store:          store,
 		log:            log,
 		flushThreshold: 500,
+		flushTimeout:   flushTimeout,
 	}
 }
 
@@ -58,7 +62,7 @@ func (w *Writer) Run() {
 		if total == 0 {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), w.flushTimeout)
 		if err := w.store.AddMulti(ctx, pending); err != nil {
 			w.log.Error("batch flush failed", zap.Error(err), zap.Int("points", total))
 		}

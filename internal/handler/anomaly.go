@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 
 	"github.com/LuisFelipeMoro/the_500mb_club_go/internal/anomaly"
 	"github.com/LuisFelipeMoro/the_500mb_club_go/internal/model"
@@ -19,8 +20,13 @@ func (h *Handler) GetAnomaly(c *fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusBadRequest)
 	}
 
-	members, err := h.Store.LastN(context.Background(), id, 256)
+	ctx, cancel := context.WithTimeout(c.UserContext(), h.ReadTimeout)
+	defer cancel()
+	members, err := h.Store.LastN(ctx, id, 256)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			h.Metrics.ReadTimeouts.Inc()
+		}
 		h.Log.Error("anomaly query failed", zap.Error(err))
 		return c.SendStatus(fiber.StatusServiceUnavailable)
 	}

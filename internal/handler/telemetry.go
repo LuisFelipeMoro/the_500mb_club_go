@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 
 	"github.com/LuisFelipeMoro/the_500mb_club_go/internal/model"
@@ -27,7 +28,9 @@ func (h *Handler) PostTelemetry(c *fiber.Ctx) error {
 	if err := validate.Point(p); err != nil {
 		return c.SendStatus(fiber.StatusBadRequest)
 	}
-	h.Writer.Push(id, [][]byte{p.Encode()})
+	if !h.Writer.Push(id, [][]byte{p.Encode()}) {
+		h.Metrics.WritesDropped.Inc() // buffer full: accepted-and-dropped, still 202 (FR-1)
+	}
 	return c.SendStatus(fiber.StatusAccepted)
 }
 
@@ -62,6 +65,7 @@ func (h *Handler) PostBatch(c *fiber.Ctx) error {
 	if h.Writer.Push(id, encoded) {
 		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"accepted": len(encoded)})
 	}
+	h.Metrics.WritesDropped.Add(float64(len(encoded))) // buffer full: report accepted:0
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"accepted": 0})
 }
 
@@ -110,8 +114,13 @@ func (h *Handler) GetTelemetry(c *fiber.Ctx) error {
 		prev, fromTS, offset = &cur, cur.TS, cur.Offset
 	}
 
-	members, err := h.Store.Range(context.Background(), id, fromTS, to, offset, int64(limit+1))
+	ctx, cancel := context.WithTimeout(c.UserContext(), h.ReadTimeout)
+	defer cancel()
+	members, err := h.Store.Range(ctx, id, fromTS, to, offset, int64(limit+1))
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			h.Metrics.ReadTimeouts.Inc()
+		}
 		h.Log.Error("range query failed", zap.Error(err))
 		return c.SendStatus(fiber.StatusServiceUnavailable)
 	}

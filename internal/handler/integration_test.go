@@ -110,9 +110,9 @@ func newTestApp(t *testing.T) (*fiber.App, *fakeStore, *batch.Writer) {
 	log := zap.NewNop()
 	store := newFakeStore()
 	m := metrics.New()
-	w := batch.New(store, 1000, log)
+	w := batch.New(store, 1000, 2*time.Second, log)
 	go w.Run()
-	h := New(store, w, m, log)
+	h := New(store, w, m, log, 250*time.Millisecond)
 
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	app.Use(middleware.Instrument("api-test", m))
