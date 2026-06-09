@@ -51,7 +51,7 @@ services:
     read_only: true
     security_opt: ["no-new-privileges:true"]
     tmpfs: [/var/cache/nginx, /var/run, /tmp]
-    networks: [backend]
+    networks: [backend, edge]                        # edge carries the published 8080; an internal-only net silently drops port publishing
     restart: unless-stopped                          # restarts if an upstream wasn't resolvable yet
     depends_on:
       api-1:
@@ -88,4 +88,5 @@ services:
 
 networks:
   backend:
-    internal: true                                   # no external egress; pairs with scratch
+    internal: true                                   # no external egress for API+Redis; pairs with scratch
+  edge: {}                                           # bridge with host connectivity; only the LB joins it, so the published 8080 is reachable
