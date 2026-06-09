@@ -19,9 +19,7 @@ services:
     tmpfs: [/tmp]
     networks: [backend]
     restart: unless-stopped                          # self-heal transient boot races
-    depends_on:
-      redis:
-        condition: service_healthy                   # API fatals if Redis not up → wait for readiness
+    depends_on: [redis]                              # service_started: boot in parallel — the binary connects lazily (LazyStore), /readyz owns readiness
 
   api-2:
     <<: *api
@@ -79,12 +77,6 @@ services:
     security_opt: ["no-new-privileges:true"]
     networks: [backend]
     restart: unless-stopped
-    healthcheck:                                     # gate APIs on real readiness, not just container start
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 1s
-      timeout: 3s
-      retries: 30
-      start_period: 2s
 
 networks:
   backend:
