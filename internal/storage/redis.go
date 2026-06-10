@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"strconv"
+	"time"
 
 	"github.com/redis/rueidis"
 )
@@ -31,6 +32,13 @@ func NewRueidisStore(addr string) (*RueidisStore, error) {
 	client, err := rueidis.NewClient(rueidis.ClientOption{
 		InitAddress:  []string{addr},
 		DisableCache: true, // no client-side cache: keeps RSS minimal
+		// Host-agnostic frugality: a smaller per-connection command ring (2^8=256
+		// in-flight, vs the 2^10 default) is ample for one multiplexed conn at this
+		// throughput and trims steady-state RSS; a tiny flush delay coalesces
+		// pipeline writes into fewer syscalls (lower CPU under load) at a
+		// sub-millisecond latency cost — negligible against the 8ms p99 SLO.
+		RingScaleEachConn: 8,
+		MaxFlushDelay:     20 * time.Microsecond,
 	})
 	if err != nil {
 		return nil, err
