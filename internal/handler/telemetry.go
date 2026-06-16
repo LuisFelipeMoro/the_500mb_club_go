@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strconv"
 
@@ -22,7 +21,7 @@ func (h *Handler) PostTelemetry(c *fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusBadRequest)
 	}
 	var p model.TelemetryPoint
-	if err := json.Unmarshal(c.Body(), &p); err != nil {
+	if err := model.UnmarshalPoint(c.Body(), &p); err != nil {
 		return c.SendStatus(fiber.StatusBadRequest)
 	}
 	if err := validate.Point(p); err != nil {
@@ -43,24 +42,22 @@ func (h *Handler) PostBatch(c *fiber.Ctx) error {
 	if !validate.DeviceID(id) {
 		return c.SendStatus(fiber.StatusBadRequest)
 	}
-	var body struct {
-		Points []model.TelemetryPoint `json:"points"`
-	}
-	if err := json.Unmarshal(c.Body(), &body); err != nil {
+	var points []model.TelemetryPoint
+	if err := model.UnmarshalBatch(c.Body(), &points); err != nil {
 		return c.SendStatus(fiber.StatusBadRequest)
 	}
-	if len(body.Points) > 100 {
+	if len(points) > 100 {
 		return c.SendStatus(fiber.StatusRequestEntityTooLarge)
 	}
-	if len(body.Points) == 0 {
+	if len(points) == 0 {
 		return c.SendStatus(fiber.StatusBadRequest)
 	}
-	if err := validate.Points(body.Points); err != nil {
+	if err := validate.Points(points); err != nil {
 		return c.SendStatus(fiber.StatusBadRequest)
 	}
-	encoded := make([][]byte, len(body.Points))
-	for i := range body.Points {
-		encoded[i] = body.Points[i].Encode()
+	encoded := make([][]byte, len(points))
+	for i := range points {
+		encoded[i] = points[i].Encode()
 	}
 	if h.Writer.Push(id, encoded) {
 		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"accepted": len(encoded)})
