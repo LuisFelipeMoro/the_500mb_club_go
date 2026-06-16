@@ -40,6 +40,16 @@ func (p TelemetryPoint) Encode() []byte {
 	return b
 }
 
+// AccelMagnitude reads ax/ay/az straight from an encoded 56-byte member and
+// returns sqrt(ax²+ay²+az²). It lets the anomaly hot path compute magnitudes
+// without allocating a TelemetryPoint per member (no battery/lat/lon needed).
+func AccelMagnitude(b []byte) float64 {
+	ax := math.Float64frombits(binary.LittleEndian.Uint64(b[32:40]))
+	ay := math.Float64frombits(binary.LittleEndian.Uint64(b[40:48]))
+	az := math.Float64frombits(binary.LittleEndian.Uint64(b[48:56]))
+	return math.Sqrt(ax*ax + ay*ay + az*az)
+}
+
 // DecodePoint reverses Encode. A NaN battery slot decodes to a nil pointer.
 func DecodePoint(b []byte) TelemetryPoint {
 	p := TelemetryPoint{

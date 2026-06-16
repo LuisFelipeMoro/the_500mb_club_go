@@ -1,11 +1,84 @@
 package anomaly
 
 import (
+	"math/rand"
 	"testing"
 
 	"github.com/LuisFelipeMoro/the_500mb_club_go/internal/model"
 	"github.com/stretchr/testify/assert"
 )
+
+// encode builds an encoded member with the given acceleration components.
+func encode(ax, ay, az float64) []byte {
+	return model.TelemetryPoint{Ts: 1, Ax: ax, Ay: ay, Az: az}.Encode()
+}
+
+// ComputeMembers (raw byte path) must match Compute (decoded path) exactly.
+func TestComputeMembersParity(t *testing.T) {
+	rng := rand.New(rand.NewSource(42))
+	for _, n := range []int{8, 11, 100, 256} {
+		win := make([]model.TelemetryPoint, n)
+		members := make([][]byte, n)
+		for i := range win {
+			ax, ay, az := rng.Float64()*4-2, rng.Float64()*4-2, 9.8+rng.Float64()*2
+			win[i] = model.TelemetryPoint{Ts: int64(i + 1), Ax: ax, Ay: ay, Az: az}
+			members[i] = win[i].Encode()
+		}
+		want, got := Compute(win), ComputeMembers(members)
+		assert.Equal(t, want.Samples, got.Samples, "n=%d samples", n)
+		assert.Equal(t, want.Anomalous, got.Anomalous, "n=%d anomalous", n)
+		assert.InDelta(t, want.ZScore, got.ZScore, 1e-9, "n=%d zscore", n)
+	}
+}
+
+func TestComputeMembersZeroStddev(t *testing.T) {
+	members := make([][]byte, 8)
+	for i := range members {
+		members[i] = encode(0, 0, 5)
+	}
+	r := ComputeMembers(members)
+	assert.Equal(t, 0.0, r.ZScore)
+	assert.False(t, r.Anomalous)
+	assert.Equal(t, 8, r.Samples)
+}
+
+func TestComputeMembersEmpty(t *testing.T) {
+	r := ComputeMembers(nil)
+	assert.Equal(t, 0, r.Samples)
+	assert.False(t, r.Anomalous)
+}
+
+func benchMembers(n int) [][]byte {
+	members := make([][]byte, n)
+	for i := range members {
+		members[i] = encode(0.1, -0.04, 9.81+float64(i%5)*0.01)
+	}
+	return members
+}
+
+// BenchmarkComputeDecoded mirrors the old handler path (decode then Compute).
+func BenchmarkComputeDecoded(b *testing.B) {
+	members := benchMembers(256)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		win := make([]model.TelemetryPoint, len(members))
+		for j, m := range members {
+			win[j] = model.DecodePoint(m)
+		}
+		_ = Compute(win)
+	}
+}
+
+// BenchmarkComputeMembers is the new allocation-free hot path.
+func BenchmarkComputeMembers(b *testing.B) {
+	members := benchMembers(256)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = ComputeMembers(members)
+	}
+}
 
 func TestMagnitude(t *testing.T) {
 	assert.InDelta(t, 5.0, Magnitude(model.TelemetryPoint{Ax: 3, Ay: 4, Az: 0}), 1e-9)

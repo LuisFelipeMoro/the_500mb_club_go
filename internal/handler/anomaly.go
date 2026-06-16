@@ -5,7 +5,6 @@ import (
 	"errors"
 
 	"github.com/LuisFelipeMoro/the_500mb_club_go/internal/anomaly"
-	"github.com/LuisFelipeMoro/the_500mb_club_go/internal/model"
 	"github.com/LuisFelipeMoro/the_500mb_club_go/internal/validate"
 	"github.com/gofiber/fiber/v2"
 	"go.uber.org/zap"
@@ -35,9 +34,5 @@ func (h *Handler) GetAnomaly(c *fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusNotFound)
 	}
 
-	window := make([]model.TelemetryPoint, len(members))
-	for i, m := range members {
-		window[i] = model.DecodePoint(m)
-	}
-	return c.Status(fiber.StatusOK).JSON(anomaly.Compute(window))
+	return c.Status(fiber.StatusOK).JSON(anomaly.ComputeMembers(members))
 }
