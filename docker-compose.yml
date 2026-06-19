@@ -1,11 +1,14 @@
 # Aggregate: 2.00 vCPU, 296 MiB (caps: 2.0 CPU / 500 MiB — validate_compose.py rejects above).
+# CPU split favors infra (lb/redis): the API replicas are the capacity-idle tier
+# (steady ~0.10 core each), while the single nginx LB and redis are the shared
+# bottleneck that caps sustained RPS. See docs/optimization/01-cpu-rebalance.md.
 # Hardening fields are also gate-injected when absent; declared here for local-prod parity.
 
 services:
   api-1: &api
     image: ghcr.io/luisfelipemoro/pi-bench:latest    # public; arm64 manifest required (lowercase per OCI)
     user: "10000:10000"                              # matches Dockerfile USER; audit_image.sh
-    cpus: '0.60'                                     # < 1.0 → automaxprocs sets GOMAXPROCS=1
+    cpus: '0.45'                                     # < 1.0 → automaxprocs sets GOMAXPROCS=1; APIs are the idle tier
     mem_limit: 64m                                   # GOMEMLIMIT=24MiB << 64m
     environment:
       REDIS_ADDR: redis:6379
@@ -42,7 +45,7 @@ services:
   lb:
     image: nginx:1.27-alpine
     ports: ["8080:80"]                               # challenge requires port 8080
-    cpus: '0.10'
+    cpus: '0.30'
     mem_limit: 24m
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
@@ -71,7 +74,7 @@ services:
       - ""
       - --appendonly
       - "no"
-    cpus: '0.10'
+    cpus: '0.35'
     mem_limit: 80m
     read_only: true
     security_opt: ["no-new-privileges:true"]
