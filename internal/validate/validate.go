@@ -3,15 +3,27 @@ package validate
 import (
 	"errors"
 	"math"
-	"regexp"
 
 	"github.com/LuisFelipeMoro/the_500mb_club_go/internal/model"
 )
 
-var deviceIDRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
-
-// DeviceID reports whether id matches ^[a-zA-Z0-9_-]{1,64}$.
-func DeviceID(id string) bool { return deviceIDRe.MatchString(id) }
+// DeviceID reports whether id matches ^[a-zA-Z0-9_-]{1,64}$. Hand-rolled byte
+// scan instead of a regexp: this runs first on every request (post/batch/range/
+// anomaly), so dropping the regexp engine removes its per-call overhead and
+// allocation from the hot path — flattening the p99 tail on GOMAXPROCS=1.
+func DeviceID(id string) bool {
+	if len(id) == 0 || len(id) > 64 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
 
 // Point validates a single TelemetryPoint's field constraints.
 func Point(p model.TelemetryPoint) error {

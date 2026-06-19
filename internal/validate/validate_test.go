@@ -2,11 +2,30 @@ package validate
 
 import (
 	"math"
+	"regexp"
 	"testing"
 
 	"github.com/LuisFelipeMoro/the_500mb_club_go/internal/model"
 	"github.com/stretchr/testify/assert"
 )
+
+// deviceIDRe is the original regexp DeviceID was built from; the fuzz test
+// pins the hand-rolled scanner to its exact accept/reject behavior.
+var deviceIDRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
+
+// FuzzDeviceID asserts the byte-scan DeviceID accepts exactly what the regexp
+// did, for any input.
+func FuzzDeviceID(f *testing.F) {
+	for _, s := range []string{"", "a", "abc", "Dev_01-XYZ", repeat("a", 64),
+		repeat("a", 65), "has space", "has/slash", "dot.dot", "\x00", "café"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, id string) {
+		if got, want := DeviceID(id), deviceIDRe.MatchString(id); got != want {
+			t.Fatalf("DeviceID(%q)=%v, regexp=%v", id, got, want)
+		}
+	})
+}
 
 func TestDeviceID(t *testing.T) {
 	assert.True(t, DeviceID("abc"))
