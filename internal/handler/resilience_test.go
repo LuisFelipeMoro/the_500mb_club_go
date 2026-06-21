@@ -25,7 +25,7 @@ func (slowStore) Range(ctx context.Context, _ string, _, _, _, _ int64) ([][]byt
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
-func (slowStore) LastN(ctx context.Context, _ string, _ int64) ([][]byte, error) {
+func (slowStore) LastN(ctx context.Context, _ string, _ int64) ([]string, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }

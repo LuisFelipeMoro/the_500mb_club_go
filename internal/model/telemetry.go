@@ -40,14 +40,23 @@ func (p TelemetryPoint) Encode() []byte {
 	return b
 }
 
-// AccelMagnitude reads ax/ay/az straight from an encoded 56-byte member and
-// returns sqrt(ax²+ay²+az²). It lets the anomaly hot path compute magnitudes
-// without allocating a TelemetryPoint per member (no battery/lat/lon needed).
-func AccelMagnitude(b []byte) float64 {
-	ax := math.Float64frombits(binary.LittleEndian.Uint64(b[32:40]))
-	ay := math.Float64frombits(binary.LittleEndian.Uint64(b[40:48]))
-	az := math.Float64frombits(binary.LittleEndian.Uint64(b[48:56]))
+// AccelMagnitudeStr reads ax/ay/az straight from an encoded 56-byte member in
+// its string form (as rueidis returns it from Redis) and returns
+// sqrt(ax²+ay²+az²). Reading from the string lets the anomaly hot path compute
+// magnitudes without copying every member into a []byte first — zero
+// allocation, no unsafe, no per-member TelemetryPoint.
+func AccelMagnitudeStr(s string) float64 {
+	ax := math.Float64frombits(leUint64(s, 32))
+	ay := math.Float64frombits(leUint64(s, 40))
+	az := math.Float64frombits(leUint64(s, 48))
 	return math.Sqrt(ax*ax + ay*ay + az*az)
+}
+
+// leUint64 decodes 8 little-endian bytes from s starting at offset i.
+func leUint64(s string, i int) uint64 {
+	_ = s[i+7] // single bounds check for the 8-byte read
+	return uint64(s[i]) | uint64(s[i+1])<<8 | uint64(s[i+2])<<16 | uint64(s[i+3])<<24 |
+		uint64(s[i+4])<<32 | uint64(s[i+5])<<40 | uint64(s[i+6])<<48 | uint64(s[i+7])<<56
 }
 
 // DecodePoint reverses Encode. A NaN battery slot decodes to a nil pointer.

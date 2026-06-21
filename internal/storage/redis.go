@@ -16,8 +16,10 @@ type Store interface {
 	AddMulti(ctx context.Context, batches map[string][][]byte) error
 	// Range returns members with score in [fromTS, toTS], skipping offset, up to count.
 	Range(ctx context.Context, deviceID string, fromTS, toTS, offset, count int64) ([][]byte, error)
-	// LastN returns up to n newest members (highest score first).
-	LastN(ctx context.Context, deviceID string, n int64) ([][]byte, error)
+	// LastN returns up to n newest members (highest score first) as the strings
+	// rueidis decodes from the reply — the anomaly path only reads them, so this
+	// avoids copying every member into a fresh []byte.
+	LastN(ctx context.Context, deviceID string, n int64) ([]string, error)
 	Ping(ctx context.Context) error
 	Close()
 }
@@ -78,7 +80,7 @@ func (s *RueidisStore) AddMulti(ctx context.Context, batches map[string][][]byte
 		cmds = append(cmds, s.client.B().Zremrangebyrank().
 			Key(key(dev)).
 			Start(0).
-			Stop(-(retainPerDevice+1)).
+			Stop(-(retainPerDevice + 1)).
 			Build())
 	}
 	for _, resp := range s.client.DoMulti(ctx, cmds...) {
@@ -100,14 +102,16 @@ func (s *RueidisStore) Range(ctx context.Context, deviceID string, fromTS, toTS,
 	return s.asMembers(ctx, cmd)
 }
 
-func (s *RueidisStore) LastN(ctx context.Context, deviceID string, n int64) ([][]byte, error) {
+func (s *RueidisStore) LastN(ctx context.Context, deviceID string, n int64) ([]string, error) {
 	cmd := s.client.B().Zrange().
 		Key(key(deviceID)).
 		Min("0").
 		Max(strconv.FormatInt(n-1, 10)).
 		Rev().
 		Build()
-	return s.asMembers(ctx, cmd)
+	// Return the decoded strings straight from the reply: the anomaly path reads
+	// ax/ay/az out of them without mutating, so no []byte copy is needed.
+	return s.client.Do(ctx, cmd).AsStrSlice()
 }
 
 func (s *RueidisStore) asMembers(ctx context.Context, cmd rueidis.Completed) ([][]byte, error) {

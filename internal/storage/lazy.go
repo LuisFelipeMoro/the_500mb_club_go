@@ -82,7 +82,7 @@ func (s *LazyStore) Range(ctx context.Context, deviceID string, fromTS, toTS, of
 	return st.Range(ctx, deviceID, fromTS, toTS, offset, count)
 }
 
-func (s *LazyStore) LastN(ctx context.Context, deviceID string, n int64) ([][]byte, error) {
+func (s *LazyStore) LastN(ctx context.Context, deviceID string, n int64) ([]string, error) {
 	st, err := s.get()
 	if err != nil {
 		return nil, err

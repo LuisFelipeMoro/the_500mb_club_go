@@ -8,9 +8,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// encode builds an encoded member with the given acceleration components.
-func encode(ax, ay, az float64) []byte {
-	return model.TelemetryPoint{Ts: 1, Ax: ax, Ay: ay, Az: az}.Encode()
+// encode builds an encoded member (as the string the storage layer hands the
+// anomaly path) with the given acceleration components.
+func encode(ax, ay, az float64) string {
+	return string(model.TelemetryPoint{Ts: 1, Ax: ax, Ay: ay, Az: az}.Encode())
 }
 
 // ComputeMembers (raw byte path) must match Compute (decoded path) exactly.
@@ -18,11 +19,11 @@ func TestComputeMembersParity(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	for _, n := range []int{8, 11, 100, 256} {
 		win := make([]model.TelemetryPoint, n)
-		members := make([][]byte, n)
+		members := make([]string, n)
 		for i := range win {
 			ax, ay, az := rng.Float64()*4-2, rng.Float64()*4-2, 9.8+rng.Float64()*2
 			win[i] = model.TelemetryPoint{Ts: int64(i + 1), Ax: ax, Ay: ay, Az: az}
-			members[i] = win[i].Encode()
+			members[i] = string(win[i].Encode())
 		}
 		want, got := Compute(win), ComputeMembers(members)
 		assert.Equal(t, want.Samples, got.Samples, "n=%d samples", n)
@@ -32,7 +33,7 @@ func TestComputeMembersParity(t *testing.T) {
 }
 
 func TestComputeMembersZeroStddev(t *testing.T) {
-	members := make([][]byte, 8)
+	members := make([]string, 8)
 	for i := range members {
 		members[i] = encode(0, 0, 5)
 	}
@@ -48,8 +49,8 @@ func TestComputeMembersEmpty(t *testing.T) {
 	assert.False(t, r.Anomalous)
 }
 
-func benchMembers(n int) [][]byte {
-	members := make([][]byte, n)
+func benchMembers(n int) []string {
+	members := make([]string, n)
 	for i := range members {
 		members[i] = encode(0.1, -0.04, 9.81+float64(i%5)*0.01)
 	}
@@ -64,7 +65,7 @@ func BenchmarkComputeDecoded(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		win := make([]model.TelemetryPoint, len(members))
 		for j, m := range members {
-			win[j] = model.DecodePoint(m)
+			win[j] = model.DecodePoint([]byte(m))
 		}
 		_ = Compute(win)
 	}
