@@ -19,23 +19,24 @@ func Magnitude(p model.TelemetryPoint) float64 {
 }
 
 // ComputeMembers is the allocation-free hot path: it computes the same result as
-// Compute directly from the encoded 56-byte members (members[0] is the newest),
-// avoiding the per-request []TelemetryPoint decode and the []float64 scratch
-// slice. Mean and variance come from a single Welford pass (population variance,
-// /n — identical to Compute). On a GOMAXPROCS=1 service this cuts ~2n heap
+// Compute directly from the encoded 56-byte members as rueidis returns them
+// (strings; members[0] is the newest), avoiding both the per-request
+// []TelemetryPoint decode and the []byte copy of every member off the Redis
+// reply. Mean and variance come from a single Welford pass (population variance,
+// /n — identical to Compute). On a GOMAXPROCS=1 service this cuts ~3n heap
 // allocations per anomaly request, shrinking GC pauses and the p99 tail.
-func ComputeMembers(members [][]byte) Result {
+func ComputeMembers(members []string) Result {
 	n := len(members)
 	r := Result{Samples: n}
 	if n == 0 {
 		return r
 	}
 
-	newest := model.AccelMagnitude(members[0])
+	newest := model.AccelMagnitudeStr(members[0])
 
 	var mean, m2 float64
 	for i, mb := range members {
-		mag := model.AccelMagnitude(mb)
+		mag := model.AccelMagnitudeStr(mb)
 		d := mag - mean
 		mean += d / float64(i+1)
 		m2 += d * (mag - mean)

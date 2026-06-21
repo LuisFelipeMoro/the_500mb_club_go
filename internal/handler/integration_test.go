@@ -84,7 +84,7 @@ func (f *fakeStore) Range(_ context.Context, dev string, fromTS, toTS, offset, c
 	return out, nil
 }
 
-func (f *fakeStore) LastN(_ context.Context, dev string, n int64) ([][]byte, error) {
+func (f *fakeStore) LastN(_ context.Context, dev string, n int64) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	keys := f.sorted(dev)
@@ -95,11 +95,7 @@ func (f *fakeStore) LastN(_ context.Context, dev string, n int64) ([][]byte, err
 	if n < int64(len(keys)) {
 		keys = keys[:n]
 	}
-	out := make([][]byte, len(keys))
-	for i := range keys {
-		out[i] = []byte(keys[i])
-	}
-	return out, nil
+	return keys, nil
 }
 
 func (f *fakeStore) Ping(context.Context) error { return nil }
