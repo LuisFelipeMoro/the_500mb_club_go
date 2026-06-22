@@ -66,11 +66,6 @@ func (h *Handler) PostBatch(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"accepted": 0})
 }
 
-type rangeResponse struct {
-	Points     []model.TelemetryPoint `json:"points"`
-	NextCursor *string                `json:"next_cursor"`
-}
-
 // GetTelemetry handles GET /devices/{id}/telemetry (FR-3): time-window range
 // with tie-safe cursor pagination. One Redis round-trip.
 func (h *Handler) GetTelemetry(c *fiber.Ctx) error {
@@ -135,10 +130,28 @@ func (h *Handler) GetTelemetry(c *fiber.Ctx) error {
 		pageLen = limit
 	}
 
-	resp := rangeResponse{Points: points[:pageLen]}
+	// Hand-rolled {"points":[...],"next_cursor":...} to avoid encoding/json
+	// reflection over up to 500 points on this read hot path. base64 cursors need
+	// no JSON escaping, so they embed directly.
+	page := points[:pageLen]
+	buf := make([]byte, 0, 16+pageLen*96)
+	buf = append(buf, `{"points":[`...)
+	for i := range page {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = page[i].AppendJSON(buf)
+	}
+	buf = append(buf, `],"next_cursor":`...)
 	if next != nil {
 		enc := storage.EncodeCursor(*next)
-		resp.NextCursor = &enc
+		buf = append(buf, '"')
+		buf = append(buf, enc...)
+		buf = append(buf, '"')
+	} else {
+		buf = append(buf, "null"...)
 	}
-	return c.Status(fiber.StatusOK).JSON(resp)
+	buf = append(buf, '}')
+	c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+	return c.Status(fiber.StatusOK).Send(buf)
 }

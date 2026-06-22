@@ -1,12 +1,68 @@
 package model
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// TestAppendJSONParity asserts the hand-rolled encoder produces JSON that
+// decodes to exactly what encoding/json would have produced (byte-identity is
+// not required; value identity is).
+func TestAppendJSONParity(t *testing.T) {
+	bat := 0.83
+	for _, p := range []TelemetryPoint{
+		{Ts: 1718800000000, Lat: -23.55, Lon: -46.63, Battery: &bat, Ax: 0.1, Ay: -0.04, Az: 9.81},
+		{Ts: 1, Lat: 0, Lon: 0, Ax: 0, Ay: 0, Az: 0},        // nil battery, all zeros
+		{Ts: 2, Lat: 90, Lon: -180, Ax: -1.5, Ay: 2.25, Az: 9.806},
+	} {
+		hand := p.AppendJSON(nil)
+		std, err := json.Marshal(p)
+		require.NoError(t, err)
+
+		var fromHand, fromStd TelemetryPoint
+		require.NoError(t, json.Unmarshal(hand, &fromHand), "hand=%s", hand)
+		require.NoError(t, json.Unmarshal(std, &fromStd))
+		assert.Equal(t, fromStd, fromHand, "hand=%s std=%s", hand, std)
+	}
+}
+
+func benchPoints(n int) []TelemetryPoint {
+	bat := 0.81
+	pts := make([]TelemetryPoint, n)
+	for i := range pts {
+		pts[i] = TelemetryPoint{Ts: int64(1718800000000 + i), Lat: -23.55, Lon: -46.63,
+			Battery: &bat, Ax: 0.1, Ay: -0.04, Az: 9.81}
+	}
+	return pts
+}
+
+// BenchmarkRangeStdJSON is the old reflection path (json.Marshal of the slice).
+func BenchmarkRangeStdJSON(b *testing.B) {
+	pts := benchPoints(50)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = json.Marshal(pts)
+	}
+}
+
+// BenchmarkRangeAppendJSON is the hand-rolled path.
+func BenchmarkRangeAppendJSON(b *testing.B) {
+	pts := benchPoints(50)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf := make([]byte, 0, 50*96)
+		for j := range pts {
+			buf = pts[j].AppendJSON(buf)
+		}
+		_ = buf
+	}
+}
 
 func TestEncodeProduces56Bytes(t *testing.T) {
 	bat := 0.5
