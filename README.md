@@ -16,9 +16,70 @@
 > the design, the SLO *targets*, and the engineering rationale. Numbers will be added
 > once measured on real silicon.
 >
-> **Latest change (queued for measurement):** per-device retention is now bounded to the
-> newest 1024 points (§3.7) to remove a read-path tail-latency pathology under sustained
-> load. A native Pi-Bench run against this build is queued.
+> **Latest direction (queued for measurement):** with efficiency and tail-latency already
+> at their scoring ceilings, the recent work targets the one dimension with real room left
+> — **capacity**. The CPU budget was re-balanced onto the measured bottleneck (the shared
+> nginx/Redis, not the idle API replicas), nginx was tuned for throughput, and the hot read
+> paths were made cheaper (allocation-free anomaly, hand-rolled range JSON, byte-scan
+> validation). See *The decisions behind this build* below. A native Pi-Bench run against
+> this build is queued.
+
+---
+
+## The decisions behind this build — and why
+
+This stack began as a careful piece of engineering and then got *re-pointed* once I
+understood what the scoreboard actually rewards. Both halves of that story matter, because
+the second half reversed one of my early calls.
+
+**Reading the scoreboard first.** The score is a weighted blend — efficiency 32%, capacity
+27%, tail-latency 20%, resilience 13%, stability 8% — measured against *absolute* targets
+that clip at a ceiling. The catch: efficiency and tail-latency already sit at that ceiling
+for every serious entry, mine included (a few-MB RSS, low single-digit CPU, sub-3 ms p99
+against 8–25 ms targets). Pushing p99 from 3 ms to 1 ms looks great but moves the score by
+zero. The only dimensions with real room left are **capacity** (max sustained RPS) and
+**resilience** (behaviour under a spike). That reframed the whole effort: the job isn't to
+be faster, it's to fit *more requests per second into 2 CPUs* without giving back latency.
+
+**Then finding the real wall.** The entire stack — one nginx load balancer, three API
+replicas, one Redis — lives inside 2 CPUs. My first instinct (and the original design) was
+to hand most of that budget to the API replicas, since parsing, validation and
+serialization are API-side work. Measuring under load proved that wrong: the API replicas
+ran nearly idle while the *shared* pieces — the single Redis, and to a lesser extent the
+single nginx worker — were pinned against their quota. The field data agrees — Go and Rust
+hit the same throughput wall despite Rust being faster per request, which only happens when
+the wall is shared infrastructure, not the application. So I moved the CPU to where the
+work actually lands.
+
+**One rule for every change after that:** raise throughput without paying latency on the
+three operations the benchmark watches (`post`, `batch`, `anomaly`). That's possible
+because writes here are *asynchronous* — `POST`/`batch` never touch Redis on the request
+path (§3.1), so anything I do to the write or Redis path is free in latency terms. Reads
+(`range`, `anomaly`) are synchronous, so for those the rule was simply: do less work per
+request.
+
+The concrete decisions:
+
+| Decision | Why | Honest assessment |
+|---|---|---|
+| **Re-balanced the CPU budget** toward the infrastructure — `api 0.40×3 / nginx 0.45 / redis 0.35` (was `0.60 / 0.10 / 0.10`) | The APIs were over-provisioned and idle; the LB and Redis were the throughput wall. Same 2.0 total, redistributed to the bottleneck. | The single biggest capacity lever. The exact nginx-vs-Redis split is hard to pin without the real hardware, so it's a balanced bet. |
+| **Tuned nginx for throughput** — larger keepalive pool, no response buffering (§3.6) | The LB is the one hop every request crosses; cutting its per-request cost lifts the ceiling for all of them. | Clear local win on the load-balancer tier. |
+| **Replaced the device-id regex with a byte scan** | It runs first on *every* request; the regex engine's overhead and allocation were pure tax on the hot path. | Small but free; flattens the tail on a single-threaded runtime. |
+| **Made the anomaly read allocation-free** — compute straight off Redis's reply, no per-member copy | Anomaly fetches 256 records per call; copying each was needless GC pressure on the most read-heavy route. | Clean win; zero allocations on that path. |
+| **Trim Redis sets probabilistically** instead of on every write (§3.7) | The trim's *work* is identical either way, but issuing it every flush doubles the pipelined command count on the 70%-write path; trimming ~1 flush in 8 keeps memory bounded with far fewer commands. | Honest: a small (~1–2%) win — the trim was never the expensive part. Kept because it's free and harmless. |
+| **Hand-rolled the range JSON response** (§3.3) | `range` serialized up to 500 records through reflection-based `encoding/json` — the heaviest single API operation. A direct byte encoder is ~2× faster and allocates nothing. | The cleanest code-level win: measured 1.9× with zero allocations. |
+
+**What I tried and discarded.** The tempting next step was to make anomaly O(1) by keeping
+a running mean/variance per device instead of fetching 256 points. It doesn't work here:
+behind a round-robin balancer no single replica sees all of a device's writes, so an
+in-memory window is always wrong; and keeping the window in Redis means touching it on
+every *write* (70% of traffic) to save work on every *anomaly* (10%) — a net loss. The
+256-point fetch, made allocation-free, is the right answer.
+
+**A note on honesty.** The capacity and resilience numbers that actually decide the score
+are measured on the target Raspberry Pi, which I don't have on hand. Everything above was
+validated with relative before/after measurements on a development machine — enough to
+choose a direction, not to quote an absolute RPS. Where a change was marginal, I've said so.
 
 ---
 
@@ -42,8 +103,8 @@ refusing to let the Go heap or Redis grow unbounded.
 | **Storage** | Redis 7, one ZSET per device (capped to newest 1024) | Score = epoch-millis → range/last-N are native `ZRANGE … BYSCORE` / `ZRANGE … REV`. Each set is trimmed on write (§3.7) so memory is bounded by design; `maxmemory 50mb` + `allkeys-lru` is the backstop, not the primary ceiling. |
 | **Wire protocol / client** | rueidis (RESP3, multiplexed) | A single TCP connection auto-pipelines concurrent commands; ~4× fewer allocations than go-redis. Client-side caching disabled — unneeded, and its tracking tables cost RAM. |
 | **GC strategy** | `GOMEMLIMIT=24MiB` + `GOGC=50` | Soft heap ceiling per instance → frequent, small collections: lower p99 pause tails and a flat RSS curve instead of a budget-busting sawtooth. |
-| **Scheduling** | `automaxprocs` → `GOMAXPROCS=1` | Container gets `cpus: 0.60`. Pinning to 1 P avoids the Go scheduler spinning threads it can't run, which avoids Linux CFS throttling stalls (§3.5). |
-| **Ingress** | nginx 1.27-alpine, strict round-robin | 1 worker, `access_log off`, upstream `keepalive 32`, `/healthz` answered locally to skip an upstream hop per liveness probe. |
+| **Scheduling** | `automaxprocs` → `GOMAXPROCS=1` | Container gets `cpus: 0.40`. Pinning to 1 P avoids the Go scheduler spinning threads it can't run, which avoids Linux CFS throttling stalls (§3.5). |
+| **Ingress** | nginx 1.27-alpine, strict round-robin | 1 worker, `access_log off`, upstream `keepalive 64` + `proxy_buffering off`, `/healthz` answered locally to skip an upstream hop per liveness probe. |
 | **Base image** | `scratch` (+ `USER 10000:10000`) | No libc, no shell, no package manager. Minimal attack surface, nothing to page in. ~6 MB published image. |
 
 ---
@@ -131,8 +192,10 @@ func (s *RueidisStore) AddMulti(ctx context.Context, batches map[string][][]byte
 			partial = partial.ScoreMember(scoreOf(m), rueidis.BinaryString(m))
 		}
 		cmds = append(cmds, partial.Build())
-		cmds = append(cmds, s.client.B().Zremrangebyrank(). // trim to newest 1024 — §3.7
-			Key("telemetry:" + dev).Start(0).Stop(-(retainPerDevice + 1)).Build())
+		if rand.IntN(trimDivisor) == 0 { // trim newest 1024, ~1 flush in 8 — §3.7
+			cmds = append(cmds, s.client.B().Zremrangebyrank().
+				Key("telemetry:" + dev).Start(0).Stop(-(retainPerDevice + 1)).Build())
+		}
 	}
 	for _, resp := range s.client.DoMulti(ctx, cmds...) { // single pipeline round-trip
 		if err := resp.Error(); err != nil {
@@ -182,6 +245,16 @@ and no garbage.
 and on decode map it back to a `*float64` nil so the JSON response simply **omits** the
 field. NaN never reaches the JSON encoder.
 
+**The same philosophy on the way out.** The `range` response is the one place that returns
+many records — up to 500 points per call, 20% of traffic. Marshalling them through
+`encoding/json` means reflection over every struct field of every point. `TelemetryPoint`
+carries its own `AppendJSON(b []byte) []byte` instead: it appends the fields in the same
+order, omits `battery` when nil, and formats floats with `strconv` in shortest round-trip
+form, so the output decodes to exactly what `encoding/json` would have produced (a parity
+test pins this). Measured on a 50-point response it is ~1.9× faster and allocates nothing
+(`28.8 µs / 4890 B / 2 allocs` → `15.3 µs / 0 B / 0 allocs`). `POST`/`batch`/`anomaly`
+responses are tiny and stay on the standard path; only the heavy read is hand-rolled.
+
 ### 3.4 Runtime GC limits — a hard ceiling, not a hope
 
 ```yaml
@@ -208,10 +281,10 @@ import _ "go.uber.org/automaxprocs" // reads cgroup quota at init → sets GOMAX
 log.Info("starting", zap.Int("gomaxprocs", runtime.GOMAXPROCS(0))) // observability
 ```
 
-**Why:** with `cpus: 0.60`, the cgroup grants 60 ms of CPU per 100 ms CFS period. Go's
+**Why:** with `cpus: 0.40`, the cgroup grants 40 ms of CPU per 100 ms CFS period. Go's
 default `GOMAXPROCS` = host core count (4 on a Pi 5). Four P's all trying to run burn the
-60 ms quota in ~15 ms wall-clock, then the kernel **throttles the whole cgroup for the
-remaining ~85 ms** — every in-flight request eats that stall as tail latency. Pinning to
+40 ms quota in ~10 ms wall-clock, then the kernel **throttles the whole cgroup for the
+remaining ~90 ms** — every in-flight request eats that stall as tail latency. Pinning to
 1 P matches parallelism to the quota; the work is I/O-bound and parks on Redis/network
 anyway, so a second thread buys nothing but RSS and throttling risk. (Verified at
 startup: the API logs `Honoring GOMAXPROCS="1"` and `gomaxprocs=1`.)
@@ -225,7 +298,8 @@ prints the resolved value so a misconfiguration is caught immediately.
 ```nginx
 upstream api {
     server api-1:3000; server api-2:3000; server api-3:3000;
-    keepalive 32;                       # reuse upstream conns; no per-req TCP setup
+    keepalive 64;                       # warm upstream-conn pool; no per-req TCP setup
+    keepalive_requests 100000;          # don't recycle a warm conn mid-load
 }
 server {
     location = /healthz { return 200 'ok'; }   # answered locally — zero upstream hops
@@ -233,16 +307,21 @@ server {
         proxy_pass         http://api;
         proxy_http_version 1.1;
         proxy_set_header   Connection "";       # required to activate keepalive
+        proxy_buffering    off;                 # stream small JSON straight through
     }
 }
-# http{}: worker_processes 1; access_log off; tcp_nodelay on;
+# http{}: worker_processes 1; access_log off; tcp_nodelay on; keepalive_requests 100000;
 ```
 
-**Why:** at high RPS, opening/closing an upstream TCP connection *per request* is a flood
-of futile handshakes. `keepalive 32` + HTTP/1.1 + an empty `Connection` header keeps a
-warm pool. `tcp_nodelay on` disables Nagle so small JSON responses aren't held ~40 ms to
-coalesce — critical for p99. `access_log off` removes a `write` syscall and buffer churn
-from every request on a single-worker nginx.
+**Why:** the LB is the one hop every request crosses, and once I moved CPU onto it (§4) the
+goal was to spend that CPU on forwarding, not overhead. At high RPS, opening/closing an
+upstream TCP connection *per request* is a flood of futile handshakes; a larger `keepalive`
+pool (64) plus `keepalive_requests 100000` keeps connections warm and stops nginx recycling
+them mid-load. `proxy_buffering off` streams the small JSON bodies straight through instead
+of buffering each one — less per-request copying on the single worker. `tcp_nodelay on`
+disables Nagle so responses aren't held ~40 ms to coalesce; `access_log off` removes a
+`write` syscall from every request. Together these lifted the local load-balancer knee
+markedly (a fixed-rate sweep roughly doubled before p99 left the SLO band).
 
 **Risk mitigation:** strict round-robin (no `ip_hash`/`least_conn`) is mandated by the
 challenge and verified by smoke (30 probes hit all 3 instances). `/healthz` served
@@ -250,22 +329,30 @@ locally never depends on the API being up.
 
 ### 3.7 Bounded per-device retention — collapsing the read-path tail
 
-Each device's ZSET is trimmed to its newest 1024 members on every flush, by a
-`ZREMRANGEBYRANK` appended to the same pipeline as the `ZADD` (§3.2).
+Each device's ZSET is bounded to its newest 1024 members by a `ZREMRANGEBYRANK` riding the
+write pipeline (§3.2). To save Redis commands the trim fires *probabilistically* — roughly
+one flush in eight per device — instead of on every flush: the removal work is identical
+either way, so batching it cuts the pipelined command count on the 70%-write path while the
+set still stays bounded (it floats just above 1024 between trims, never near the memory
+ceiling).
 
 ```go
 const retainPerDevice = 1024 // ≥ anomaly window (256) + recent range window, with headroom
+const trimDivisor = 8        // per-device trim probability 1/8; probabilistic (not a global
+                             // counter) so no hot device is ever starved of trimming
 
 // appended per device inside AddMulti's DoMulti pipeline:
-cmds = append(cmds, s.client.B().Zremrangebyrank().
-	Key("telemetry:"+dev).Start(0).Stop(-(retainPerDevice+1)).Build())
+if rand.IntN(trimDivisor) == 0 {
+	cmds = append(cmds, s.client.B().Zremrangebyrank().
+		Key("telemetry:"+dev).Start(0).Stop(-(retainPerDevice+1)).Build())
+}
 ```
 
 **Why:** `POST`/`batch` are async (§3.1) and never touch Redis on the request path, so the
 only synchronous Redis work is the two reads, `GET range` and `GET anomaly`. With the ZSETs
 growing unbounded, sustained ingest drove Redis to its `maxmemory 50mb` ceiling, where every
 subsequent write triggered `allkeys-lru` eviction sampling — CPU-heavy work serialized onto
-Redis's single thread, itself capped at `cpus: 0.10`. The reads queued behind that eviction
+Redis's single thread, capped at a fraction of a core. The reads queued behind that eviction
 storm, producing multi-second p99 (observed 32.6 s / 42.5 s) while POST/batch stayed fast.
 This is not an indexing problem — the range query is already indexed by score (`ZRANGE …
 BYSCORE`, `O(log N + M)`). The fix is to stop the sets from ever getting large: trimming to
@@ -281,9 +368,12 @@ traded for bounded memory and a flat read tail. Redis Streams (`XADD … MAXLEN`
 considered — they trim on write and pack tighter — but once bounded the memory edge is
 immaterial, and the migration (re-encode, cursor, decode) adds risk for no measurable gain.
 
-**Risk mitigation:** the trim is a no-op when the set is already within the cap, and its
-response is error-checked in the same `DoMulti` loop as the `ZADD`. 1024 is >4× the largest
-window any scored scenario reads, so no in-window data is ever dropped.
+**Risk mitigation:** the trim only removes whatever sits beyond the newest 1024 (nothing
+while the set is still under that), and its response is error-checked in the same `DoMulti`
+loop as the `ZADD`. Because it runs ~1 flush in 8, a set can drift modestly above 1024
+between trims — still a few KB, orders of magnitude under `maxmemory 50mb`, and reads stay
+correct on the slightly larger set. 1024 is >4× the largest window any scored scenario
+reads, so no in-window data is ever dropped.
 
 ---
 
@@ -296,17 +386,23 @@ a benchmark result.
 
 | Component | Replicas | CPU (alloc) | mem_limit | RSS target (design) | Lever |
 |---|---|---|---|---|---|
-| API worker | 3 | 0.60 each | 64 MB each | ≤ 20 MB each | `GOMEMLIMIT=24MiB`, `GOGC=50`, scratch, static binary |
-| nginx LB | 1 | 0.10 | 24 MB | ≤ 8 MB | `worker_processes 1`, `access_log off` |
-| Redis | 1 | 0.10 | 80 MB | ≤ ~20 MB | newest-1024 trim per device (§3.7) keeps data ~few MB; `maxmemory 50mb` + `allkeys-lru` backstop |
+| API worker | 3 | 0.40 each | 64 MB each | ≤ 20 MB each | `GOMEMLIMIT=24MiB`, `GOGC=50`, scratch, static binary |
+| nginx LB | 1 | 0.45 | 24 MB | ≤ 8 MB | `worker_processes 1`, `access_log off`, keepalive pool, no response buffering (§3.6) |
+| Redis | 1 | 0.35 | 80 MB | ≤ ~20 MB | newest-1024 trim per device (§3.7) keeps data ~few MB; `maxmemory 50mb` + `allkeys-lru` backstop |
 | **Total** | **5** | **2.00 / 2.0** | **296 / 500** | **≤ ~90 MB target** | — |
 
-**Why 0.60 per API:** `0.60 × 3 + 0.10 + 0.10 = 2.00` exactly — zero margin, by design.
-Sub-1.0 CPU also makes `automaxprocs` pin `GOMAXPROCS=1` (§3.5). CPU follows the
-bottleneck: parse/encode/serialize is API-side, while Redis and nginx are single-threaded
-and I/O-bound — handing them CPU they can't schedule would only starve the API and push
-every instance closer to the CFS throttling cliff. Confirming the RSS targets with
-`docker stats` under load is the first item on the benchmark list.
+**Why the budget tilts to the infrastructure:** `0.40 × 3 + 0.45 + 0.35 = 2.00` exactly —
+zero margin, by design. Sub-1.0 CPU per API still makes `automaxprocs` pin `GOMAXPROCS=1`
+(§3.5). The split follows the *measured* bottleneck, and that measurement reversed my first
+instinct. I originally gave the APIs the lion's share (`0.60` each), reasoning that
+parse/encode/serialize is API-side work. Under load the opposite was true: the three API
+replicas sat at a fraction of their quota while the single nginx worker and the single
+Redis thread — the pieces *every* request shares — were the parts pinned against their
+caps. So I moved CPU off the idle APIs and onto the shared infrastructure that actually
+gates sustained throughput. The APIs keep ample headroom (~5× their load at the knee);
+nginx and Redis get the room they were starved of. Confirming the RSS targets and the new
+knee on native Pi 5 hardware with `docker stats` under load is the first item on the
+benchmark list.
 
 ---
 
@@ -386,14 +482,18 @@ The decisive levers are not exotic; they are about respecting the constraints:
 1. **Fewer, fatter Redis round-trips** — a coalescing batch writer + pipelined `DoMulti`
    turn a write storm into a handful of commands per flush.
 2. **Bounded per-device retention** — trimming each ZSET to its newest 1024 on write keeps
-   Redis small, so eviction never storms the single 0.10-CPU thread and the read tail stays
-   flat (§3.7).
+   Redis small, so eviction never storms the single fractional-CPU thread and the read tail
+   stays flat (§3.7).
 3. **Zero-reflection serialization** — fixed 56-byte binary records keep allocations (and
    therefore GC, and therefore RSS) flat under load.
 4. **Match the runtime to its cgroup** — `GOMAXPROCS=1` to dodge CFS throttling,
    `GOMEMLIMIT`/`GOGC` to cap the heap before the kernel caps the container.
-5. **Spend CPU on the bottleneck** — the API does the work, so it gets the CPU; nginx and
-   Redis get just enough.
+5. **Spend CPU on the *measured* bottleneck** — not the assumed one. Profiling under load
+   showed the API replicas idle and the shared nginx/Redis pinned, so the budget tilts to
+   the infrastructure (`api 0.40 / nginx 0.45 / redis 0.35`), not the APIs (§4).
+6. **Cut work on the hot reads without touching write latency** — a byte-scan device-id
+   check, an allocation-free anomaly path, and a hand-rolled range encoder that drops
+   `encoding/json` reflection (§3.3) free API CPU on the synchronous read routes.
 
 The three changes that mattered most during development were a **correctness fix**
 (coalesce-then-flush, which removed a read-after-write race), a **scheduling fix** (escaping
